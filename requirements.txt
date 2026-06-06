@@ -1,6 +1,8 @@
-torch==2.2.2
+# Torch CPU-only: evita descargar las dependencias CUDA (~2 GB) que hacen que
+# la imagen de Railway exceda el límite de tamaño y el build falle.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
 fastapi==0.115.0
 uvicorn==0.30.6
 numpy==1.26.4
-scikit-learn==1.4.2
 pydantic>=2.0.0
