@@ -7,6 +7,7 @@ from pydantic import BaseModel
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.optimize import minimize
 
 # ── Configuración por entorno (con valores por defecto seguros) ────────────────
 MODEL_PATH = os.getenv("MODEL_PATH", "financial_lstm_v2_checkpoint.pt")
@@ -140,6 +141,29 @@ print(
 )
 
 
+# ── Optimización de Markowitz ─────────────────────────────────────────────────
+def markowitz_weights(mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
+    """Calcula pesos de máximo Sharpe (long-only, suma = 1).
+    Si la optimización falla, devuelve pesos equiponderados como fallback."""
+    n = len(mu)
+    cov_reg = cov + 1e-6 * np.eye(n)   # regularización para evitar matriz singular
+
+    def neg_sharpe(w):
+        ret = float(w @ mu)
+        vol = float(np.sqrt(w @ cov_reg @ w))
+        return -ret / (vol + 1e-10)
+
+    result = minimize(
+        neg_sharpe,
+        x0=np.ones(n) / n,
+        method="SLSQP",
+        bounds=[(0.0, 1.0)] * n,
+        constraints={"type": "eq", "fun": lambda w: w.sum() - 1},
+        options={"ftol": 1e-9, "maxiter": 1000},
+    )
+    return result.x if result.success else np.ones(n) / n
+
+
 # ── App FastAPI ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="MacroPulse API",
@@ -202,14 +226,20 @@ def predict(req: PredictRequest):
     pred_real = pred_scaled[:N_ASSETS] * SCALER_SCALE[:N_ASSETS] + SCALER_MEAN[:N_ASSETS]
 
     predicted_returns = {t: float(r) for t, r in zip(TICKERS, pred_real)}
-    exp_port_ret = float(
-        sum(pred_real[i] * OPT_WEIGHTS[t] for i, t in enumerate(TICKERS))
-    )
+
+    # Markowitz dinámico: covarianza estimada a partir de los retornos
+    # históricos de la ventana recibida (primeras N_ASSETS columnas).
+    returns_window = mat[:, :N_ASSETS] * SCALER_SCALE[:N_ASSETS] + SCALER_MEAN[:N_ASSETS]
+    cov = np.cov(returns_window.T, ddof=1).astype(np.float64)
+    weights_arr = markowitz_weights(pred_real.astype(np.float64), cov)
+    portfolio_weights = {t: float(w) for t, w in zip(TICKERS, weights_arr)}
+
+    exp_port_ret = float(np.dot(weights_arr, pred_real))
 
     return PredictResponse(
         predicted_returns=predicted_returns,
-        portfolio_weights=OPT_WEIGHTS,
+        portfolio_weights=portfolio_weights,
         expected_portfolio_return=exp_port_ret,
         scaler_applied=HAS_SCALER,
-        weights_source=WEIGHTS_SOURCE,
+        weights_source="markowitz_dynamic",
     )
