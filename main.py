@@ -43,8 +43,11 @@ class FinancialLSTM_V2(nn.Module):
 
 # ── Esquemas Pydantic ──────────────────────────────────────────────────────────
 class PredictRequest(BaseModel):
-    # Ventana temporal × n_features (matriz, row-major)
-    features: List[List[float]]   # shape: [seq_length, n_features]
+    features: List[List[float]]          # shape: [seq_length, n_features]
+    default_max_weight: float = 0.25     # límite superior por defecto para cada activo
+    min_weight: Dict[str, float] = {}    # mínimo por ticker  {"AGG": 0.05}
+    max_weight: Dict[str, float] = {}    # máximo por ticker  {"AMD": 0.10, "CM": 0.10}
+    tickers: List[str] = []              # subconjunto de activos a considerar (vacío = todos)
 
 
 class PredictResponse(BaseModel):
@@ -53,6 +56,7 @@ class PredictResponse(BaseModel):
     expected_portfolio_return: float
     scaler_applied: bool
     weights_source: str
+    constraints_applied: Dict[str, Dict[str, float]]  # bounds efectivos usados
 
 
 # ── Carga del artefacto y reconstrucción del modelo ───────────────────────────
@@ -142,11 +146,15 @@ print(
 
 
 # ── Optimización de Markowitz ─────────────────────────────────────────────────
-def markowitz_weights(mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
-    """Calcula pesos de máximo Sharpe (long-only, suma = 1).
-    Si la optimización falla, devuelve pesos equiponderados como fallback."""
+def markowitz_weights(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    bounds: list[tuple[float, float]],
+) -> np.ndarray:
+    """Calcula pesos de máximo Sharpe dados bounds por activo (long-only, suma = 1).
+    Si la optimización falla, devuelve pesos equiponderados dentro de los bounds."""
     n = len(mu)
-    cov_reg = cov + 1e-6 * np.eye(n)   # regularización para evitar matriz singular
+    cov_reg = cov + 1e-6 * np.eye(n)
 
     def neg_sharpe(w):
         ret = float(w @ mu)
@@ -155,13 +163,17 @@ def markowitz_weights(mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
 
     result = minimize(
         neg_sharpe,
-        x0=np.ones(n) / n,
+        x0=np.array([min(1 / n, b[1]) for b in bounds]),
         method="SLSQP",
-        bounds=[(0.0, 1.0)] * n,
+        bounds=bounds,
         constraints={"type": "eq", "fun": lambda w: w.sum() - 1},
         options={"ftol": 1e-9, "maxiter": 1000},
     )
-    return result.x if result.success else np.ones(n) / n
+    if result.success:
+        return result.x
+    # fallback: pesos equiponderados recortados a los bounds
+    w = np.clip(np.ones(n) / n, [b[0] for b in bounds], [b[1] for b in bounds])
+    return w / w.sum()
 
 
 # ── App FastAPI ────────────────────────────────────────────────────────────────
@@ -227,14 +239,35 @@ def predict(req: PredictRequest):
 
     predicted_returns = {t: float(r) for t, r in zip(TICKERS, pred_real)}
 
-    # Markowitz dinámico: covarianza estimada a partir de los retornos
-    # históricos de la ventana recibida (primeras N_ASSETS columnas).
-    returns_window = mat[:, :N_ASSETS] * SCALER_SCALE[:N_ASSETS] + SCALER_MEAN[:N_ASSETS]
-    cov = np.cov(returns_window.T, ddof=1).astype(np.float64)
-    weights_arr = markowitz_weights(pred_real.astype(np.float64), cov)
-    portfolio_weights = {t: float(w) for t, w in zip(TICKERS, weights_arr)}
+    # Filtrar activos si el usuario pidió un subconjunto
+    active_tickers = [t for t in req.tickers if t in TICKERS] if req.tickers else TICKERS
+    if not active_tickers:
+        raise HTTPException(status_code=422, detail=f"Ningún ticker válido en {req.tickers}.")
+    active_idx = [TICKERS.index(t) for t in active_tickers]
 
-    exp_port_ret = float(np.dot(weights_arr, pred_real))
+    # Construir bounds por activo: [min, max] con defaults
+    bounds = []
+    constraints_applied = {}
+    for t in active_tickers:
+        lo = float(np.clip(req.min_weight.get(t, 0.0), 0.0, 1.0))
+        hi = float(np.clip(req.max_weight.get(t, req.default_max_weight), lo, 1.0))
+        bounds.append((lo, hi))
+        constraints_applied[t] = {"min": lo, "max": hi}
+
+    # Markowitz dinámico sobre el subconjunto activo
+    mu_active = pred_real[active_idx].astype(np.float64)
+    returns_window = mat[:, :N_ASSETS] * SCALER_SCALE[:N_ASSETS] + SCALER_MEAN[:N_ASSETS]
+    cov_full = np.cov(returns_window.T, ddof=1).astype(np.float64)
+    cov_active = cov_full[np.ix_(active_idx, active_idx)]
+
+    weights_arr = markowitz_weights(mu_active, cov_active, bounds)
+
+    # Reconstruir diccionario completo (activos excluidos = 0)
+    portfolio_weights = {t: 0.0 for t in TICKERS}
+    for t, w in zip(active_tickers, weights_arr):
+        portfolio_weights[t] = float(w)
+
+    exp_port_ret = float(np.dot(weights_arr, mu_active))
 
     return PredictResponse(
         predicted_returns=predicted_returns,
@@ -242,4 +275,5 @@ def predict(req: PredictRequest):
         expected_portfolio_return=exp_port_ret,
         scaler_applied=HAS_SCALER,
         weights_source="markowitz_dynamic",
+        constraints_applied=constraints_applied,
     )
